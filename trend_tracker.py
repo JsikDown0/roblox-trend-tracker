@@ -61,6 +61,7 @@ EARN_JUMP = int(os.getenv("EARN_JUMP", "10"))         # 매출 순위: 하루에
 WEEKLY_DAY = int(os.getenv("WEEKLY_DAY", "6"))         # 주간 요약을 붙일 리포트 기준 요일(0=월 … 6=일 → 월요일 아침에 도착)
 DEVICE_GAP = int(os.getenv("DEVICE_GAP", "30"))       # 모바일/PC 순위 차이가 이 이상이면 표시
 KW_YOUNG_DAYS = int(os.getenv("KW_YOUNG_DAYS", "90"))  # 클론 신호: 이 일수 이내 출시작 이름만 봄
+MIN_GAP_MIN = int(os.getenv("MIN_GAP_MIN", "100"))   # 직전 측정과 이 분 이내면 측정 건너뜀(중복 실행 방지)
 LOOKBACK_DAYS = 8                                      # 비교용으로 불러올 과거 일수
 AFK_VISITS_PER_CCU = float(os.getenv("AFK_VISITS_PER_CCU", "8"))  # 이보다 낮으면 ⚠️
 
@@ -356,6 +357,7 @@ def merge_run(daily: dict, run: dict) -> dict:
         for vk, vs in run["variants"].items()
     }
     daily["latest_at"] = run["hhmm"]
+    daily["last_ts"] = run["ts"]
     return daily
 
 
@@ -1255,7 +1257,15 @@ def main():
     meta.setdefault("first_day", today)
     daily = load_daily(today) or {"date": today}
 
-    if not args.report_only:
+    # 다른 경로(외부 예약 / GitHub 예약)로 방금 측정했으면 건너뜀
+    skip_collect = False
+    if not args.report_only and not force and daily.get("last_ts"):
+        gap = (now.timestamp() - daily["last_ts"]) / 60
+        if 0 <= gap < MIN_GAP_MIN:
+            skip_collect = True
+            print(f"직전 측정({daily.get('latest_at')})이 {gap:.0f}분 전이라 이번 측정은 건너뛰어요.")
+
+    if not args.report_only and not skip_collect:
         try:
             run = collect_run(now, list(watch.keys()))
         except Exception as e:

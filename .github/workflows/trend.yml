@@ -5,7 +5,14 @@ on:
     # 3시간마다 측정 (한국 시간 0:17, 3:17, 6:17, 9:17, 12:17, 15:17, 18:17, 21:17)
     # 리포트는 REPORT_HOUR(기본 9시) 이후 첫 측정 때 하루 한 번만 보내요.
     - cron: "17 */3 * * *"
-  workflow_dispatch: {}   # Actions 탭 'Run workflow' 버튼: 측정 + 리포트 즉시 전송
+  workflow_dispatch:
+    inputs:
+      report:
+        description: "리포트 전송 (now: 지금 바로 / auto: 오전 9시 이후 하루 한 번)"
+        type: choice
+        options: [now, auto]
+        default: now
+  # 외부 예약(cron-job.org 등)은 API로 inputs.report=auto 를 보내서 실행해요.
 
 permissions:
   contents: write         # 기록(data/)을 저장소에 커밋하기 위해 필요
@@ -28,7 +35,7 @@ jobs:
       - name: 측정 (리포트 시간이면 디스코드 전송)
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          FORCE_REPORT: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+          FORCE_REPORT: ${{ github.event_name == 'workflow_dispatch' && inputs.report == 'now' && '1' || '0' }}
           # 아래 값들은 원하면 바꿔도 돼요
           REPORT_HOUR: "9"                    # 리포트 받을 시각(한국 시간, 이 시각 이후 첫 측정 때 전송)
           MIN_CCU: "300"                      # 급상승 후보 최소 평균 동접

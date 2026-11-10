@@ -58,6 +58,30 @@
 2. 수동 실행은 시간과 상관없이 바로 리포트를 보내요. 첫날은 "오늘 지금까지" 기록으로 순위와 신작만 나와요.
 3. 이후엔 3시간마다 자동으로 측정하고, 리포트는 매일 오전 9시 17분쯤 와요. GitHub 사정으로 수십 분 늦을 때가 있어요.
 
+## 정확한 시각에 돌리기 (외부 예약, 권장)
+
+GitHub 예약 실행은 무료 저장소에서 자주 늦어지거나 빠져요. 그래서 cron-job.org 같은 무료 서비스가 3시간마다 GitHub에 실행 요청을 보내게 하는 걸 권장해요. GitHub 예약은 백업으로 그대로 두고, 직전 측정이 100분 안에 있으면 자동으로 건너뛰어서 중복 측정은 안 생겨요.
+
+1. **GitHub 토큰 만들기:** 프로필 → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token
+   - Repository access: Only select repositories → `roblox-trend-tracker`
+   - Permissions → Repository permissions → **Actions: Read and write**
+   - 만료 기간을 정하고 생성한 뒤 토큰을 복사해요(다시 볼 수 없어요).
+2. **cron-job.org에서 작업 만들기:** 가입 → Create cronjob
+   - URL: `https://api.github.com/repos/JsikDown0/roblox-trend-tracker/actions/workflows/trend.yml/dispatches`
+   - Schedule: 사용자 지정(Custom), 시간대 Asia/Seoul, 매일 0·3·6·9·12·15·18·21시 17분
+   - Advanced → Request method: **POST**
+   - Headers:
+     - `Authorization`: `Bearer 복사한토큰`
+     - `Accept`: `application/vnd.github+json`
+     - `Content-Type`: `application/json`
+   - Request body: `{"ref":"main","inputs":{"report":"auto"}}`
+3. **테스트:** 작업 화면의 Test run(실행) → 응답 코드 **204**면 성공이에요. Actions 탭에 새 실행이 생겨요.
+   - 401/403: 토큰이나 권한(Actions: Read and write) 문제
+   - 404: URL 오타, 또는 토큰에 이 저장소가 선택되지 않음
+   - 422: 본문 오타
+
+Actions 탭의 **Run workflow** 버튼은 `report` 값이 기본 `now`라 누르면 바로 리포트가 와요. 외부 예약은 `auto`라서 오전 9시 이후 첫 측정 때만 하루 한 번 보내요.
+
 ## 기록이 쌓이는 속도
 
 | 기간 | 작동하는 것 |
@@ -82,6 +106,7 @@
 - `MIN_CCU`: 급상승 후보 최소 평균 동접(기본 300)
 - `NEW_GAME_DAYS`: 신작 기준 일수(기본 60)
 - `TOP_N`: 섹션별 표시 개수(기본 10)
+- `MIN_GAP_MIN`: 직전 측정과 이 분 이내면 측정 건너뜀(기본 100분)
 - `WATCH_DAYS`: 차트에서 빠진 뒤 추적 일수(기본 30)
 - `EARN_TOP` / `EARN_JUMP`: 매출 순위 감시 범위(기본 50위)와 급등 기준(기본 10계단)
 - `DEVICE_GAP`: 모바일/PC 순위 차이 기준(기본 30계단)
