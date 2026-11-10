@@ -56,6 +56,9 @@ REPORT_HOUR = int(os.getenv("REPORT_HOUR", "9"))       # 이 시각(KST) 이후 
 WATCH_DAYS = int(os.getenv("WATCH_DAYS", "30"))        # 차트에서 빠진 뒤에도 추적하는 일수
 WATCH_MAX = int(os.getenv("WATCH_MAX", "5000"))        # 관심 목록 최대 크기
 MAX_SORTS = int(os.getenv("MAX_SORTS", "40"))          # 기준별 수집할 정렬 최대 개수
+EARN_TOP = int(os.getenv("EARN_TOP", "50"))           # 매출 순위: 이 순위 안을 대상으로 봄
+EARN_JUMP = int(os.getenv("EARN_JUMP", "10"))         # 매출 순위: 하루에 이만큼 이상 오르면 표시
+WEEKLY_DAY = int(os.getenv("WEEKLY_DAY", "6"))         # 주간 요약을 붙일 리포트 기준 요일(0=월 … 6=일 → 월요일 아침에 도착)
 KW_YOUNG_DAYS = int(os.getenv("KW_YOUNG_DAYS", "90"))  # 클론 신호: 이 일수 이내 출시작 이름만 봄
 LOOKBACK_DAYS = 8                                      # 비교용으로 불러올 과거 일수
 AFK_VISITS_PER_CCU = float(os.getenv("AFK_VISITS_PER_CCU", "8"))  # 이보다 낮으면 ⚠️
@@ -637,6 +640,68 @@ def analyze(report_day: str, days: dict[str, dict], watch: dict, meta: dict, ran
             c["search"] = search_keyword(c["kw"])
             time.sleep(0.3)
 
+    # 6) 매출 순위 (Top Earning). 자주 안 바뀌므로 '변화'만 보여주고, 전체 순위는 주 1회
+    earn = {"new": [], "jump": [], "young": [], "weekly": None, "efficient": [], "sid": None}
+    main_ranks = (ranks_now or {}).get(main_vk, {})
+    earn_sid = next((sid for sid in main_ranks if "earning" in sid.lower()), None)
+    play_sid = next((sid for sid in main_ranks if "playing" in sid.lower()), None)
+    if earn_sid:
+        earn["sid"] = earn_sid
+        key = f"{main_vk}|{earn_sid}"
+
+        def rank_on(daily, uid, k=key):
+            return ((daily or {}).get("games", {}).get(uid, {}).get("r") or {}).get(k)
+
+        prev1 = dd.get(day_str(D - timedelta(days=1)))
+        prev7 = dd.get(day_str(D - timedelta(days=7)))
+        recent_prev = [dd.get(day_str(D - timedelta(days=b))) for b in range(1, 8)]
+        recent_prev = [x for x in recent_prev if x]
+        for uid, g in games.items():
+            rk = rank_on(cur, uid)
+            if not rk or rk > EARN_TOP:
+                continue
+            st = stats_on(uid, D)
+            age = None
+            try:
+                age = (D - date.fromisoformat(g.get("c", "")[:10])).days
+            except ValueError:
+                pass
+            row = {"uid": uid, "rank": rk, "st": st, "age": age}
+            # 신규 진입: 지난 7일 동안 한 번도 상위 EARN_TOP에 없던 게임
+            if recent_prev:
+                was_in = any((rank_on(x, uid) or 9999) <= EARN_TOP for x in recent_prev)
+                if not was_in:
+                    row["prev"] = rank_on(prev1, uid)
+                    earn["new"].append(row)
+                    continue
+            # 급등: 전날보다 EARN_JUMP 계단 이상 상승
+            p1 = rank_on(prev1, uid)
+            if p1 and p1 - rk >= EARN_JUMP:
+                earn["jump"].append({**row, "prev": p1})
+                continue
+            # 신작 매출 상위: 출시 KW_YOUNG_DAYS일 이내인데 매출 상위
+            if age is not None and 0 <= age <= KW_YOUNG_DAYS:
+                earn["young"].append({**row, "prev": p1})
+        earn["new"].sort(key=lambda r: r["rank"])
+        earn["jump"].sort(key=lambda r: r["prev"] - r["rank"], reverse=True)
+        earn["young"].sort(key=lambda r: r["rank"])
+
+        # 주간 요약: 지정 요일이거나 기록이 하루뿐일 때 전체 상위 10 + 수익 효율 게임
+        if D.weekday() == WEEKLY_DAY or len(hist_days) < 2:
+            ids = (main_ranks.get(earn_sid) or {}).get("ids", [])[:TOP_N]
+            rows = []
+            for i, uid in enumerate(ids, start=1):
+                p7 = rank_on(prev7, uid)
+                rows.append({"uid": uid, "rank": i, "prev7": p7, "has_prev7": prev7 is not None})
+            earn["weekly"] = rows
+            # 수익 효율: 매출은 상위인데 동접 순위는 한참 아래(또는 동접 상위 100 밖)
+            play_rank = {u: i + 1 for i, u in enumerate((main_ranks.get(play_sid) or {}).get("ids", []))} if play_sid else {}
+            for i, uid in enumerate((main_ranks.get(earn_sid) or {}).get("ids", [])[:EARN_TOP], start=1):
+                pr = play_rank.get(uid)
+                if pr is None or pr - i >= 30:
+                    earn["efficient"].append({"uid": uid, "rank": i, "play_rank": pr, "st": stats_on(uid, D)})
+            earn["efficient"] = earn["efficient"][:5]
+
     return {
         "report_day": report_day,
         "partial": bool(cur) and cur.get("partial", False),
@@ -653,6 +718,7 @@ def analyze(report_day: str, days: dict[str, dict], watch: dict, meta: dict, ran
         "young": young[:TOP_N],
         "clones": clones,
         "has_compare": len(hist_days) >= 2,
+        "earn": earn,
     }
 
 
@@ -730,7 +796,7 @@ def clamp_lines(lines: list[str], limit: int = 3900) -> str:
 
 
 COLORS = {"head": 0x5865F2, "featured": 0xF1C40F, "kr": 0xE67E22, "rising": 0xE74C3C, "new": 0x2ECC71,
-          "young": 0x3498DB, "clone": 0x9B59B6}
+          "young": 0x3498DB, "clone": 0x9B59B6, "earn": 0x1ABC9C}
 
 
 def build_embeds(a: dict, L: Linker, report_hhmm: str) -> list[dict]:
@@ -741,7 +807,7 @@ def build_embeds(a: dict, L: Linker, report_hhmm: str) -> list[dict]:
     head = [
         f"**{D.month}/{D.day}({wd}) {span}** 기준 · 측정 {a['runs']}회 · 게임 {a['n_games']}개 (관심 목록 {a['n_watch']}개)",
         f"순위는 오늘 {report_hhmm} KST 기준",
-        "💰 스폰서 광고 노출 · ⚠️ 방문 대비 동접이 높음(AFK 가능성)",
+        "⚠️ 방문 대비 동접이 높음(AFK 가능성)",
     ]
     if a["n_days"] < 2:
         head.append("\n기록이 아직 하루치라 비교 섹션은 내일부터 채워져요. 1주일쯤 쌓이면 연속 상승·요일 비교·클론 신호가 제대로 작동해요.")
@@ -797,6 +863,52 @@ def build_embeds(a: dict, L: Linker, report_hhmm: str) -> list[dict]:
         vpd = f" · 하루 방문 {fmt_num(st['vpd'])}" if st["vpd"] else ""
         lines.append(f"{L.link(r['uid'])}{flags(st)} · 출시 {r['age']}일 · 평균 동접 **{fmt_num(st['avg'])}**{delta}{vpd}")
     E.append({"title": f"🐣 신작 레이더 · 출시 {NEW_GAME_DAYS}일 이내", "description": clamp_lines(lines), "color": COLORS["young"]})
+
+    ea = a.get("earn") or {}
+    if ea.get("sid"):
+        def erow(r, tail=""):
+            st = r.get("st")
+            ccu = f" · 평균 동접 {fmt_num(st['avg'])}" if st else ""
+            return f"**{r['rank']}위** {L.link(r['uid'])}{flags(st)}{tail}{ccu}{L.age(r['uid'])}"
+        lines = []
+        if ea["new"]:
+            lines.append("__새로 진입__ (지난 7일간 상위 %d위 밖)" % EARN_TOP)
+            lines += [erow(r, f" `NEW`") for r in ea["new"][:TOP_N]]
+        if ea["jump"]:
+            lines.append("__급등__ (전날보다 %d계단 이상)" % EARN_JUMP)
+            lines += [erow(r, f" `▲{r['prev'] - r['rank']}`") for r in ea["jump"][:TOP_N]]
+        if ea["young"]:
+            lines.append("__신작이 매출 상위__ (출시 %d일 이내)" % KW_YOUNG_DAYS)
+            for r in ea["young"][:TOP_N]:
+                mv = ""
+                if r.get("prev"):
+                    d = r["prev"] - r["rank"]
+                    mv = f" `▲{d}`" if d > 0 else (f" `▼{-d}`" if d < 0 else " `-`")
+                lines.append(erow(r, mv))
+        if lines:
+            E.append({"title": f"💵 매출 순위 변화 (Top Earning 상위 {EARN_TOP}, {vlabel(VARIANTS[0])})",
+                      "description": clamp_lines(lines), "color": COLORS["earn"]})
+        elif a["has_compare"]:
+            E.append({"title": "💵 매출 순위 변화", "description": "조건에 맞는 변화가 없어요 (새 진입·급등·신작 없음).",
+                      "color": COLORS["earn"]})
+        if ea.get("weekly"):
+            lines = []
+            for r in ea["weekly"]:
+                mv = ""
+                if r["has_prev7"]:
+                    if r["prev7"] is None:
+                        mv = " `NEW`"
+                    else:
+                        d = r["prev7"] - r["rank"]
+                        mv = f" `▲{d}`" if d > 0 else (f" `▼{-d}`" if d < 0 else " `-`")
+                lines.append(f"**{r['rank']}.** {L.link(r['uid'])}{mv}{L.age(r['uid'])}")
+            if ea["efficient"]:
+                lines.append("\n__동접에 비해 매출이 높은 게임__ (수익 구조 참고용)")
+                for r in ea["efficient"]:
+                    pr = f"동접 순위 {r['play_rank']}위" if r["play_rank"] else "동접 상위 100 밖"
+                    lines.append(f"매출 {r['rank']}위 · {pr} · {L.link(r['uid'])}")
+            title = "📅 주간 매출 상위 %d" % len(ea["weekly"]) + (" (1주 전 대비)" if ea["weekly"] and ea["weekly"][0]["has_prev7"] else "")
+            E.append({"title": title, "description": clamp_lines(lines), "color": COLORS["earn"]})
 
     lines = []
     for c in a["clones"]:
