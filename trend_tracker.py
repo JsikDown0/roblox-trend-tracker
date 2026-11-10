@@ -56,6 +56,7 @@ REPORT_HOUR = int(os.getenv("REPORT_HOUR", "9"))       # 이 시각(KST) 이후 
 WATCH_DAYS = int(os.getenv("WATCH_DAYS", "30"))        # 차트에서 빠진 뒤에도 추적하는 일수
 WATCH_MAX = int(os.getenv("WATCH_MAX", "5000"))        # 관심 목록 최대 크기
 MAX_SORTS = int(os.getenv("MAX_SORTS", "40"))          # 기준별 수집할 정렬 최대 개수
+KW_YOUNG_DAYS = int(os.getenv("KW_YOUNG_DAYS", "90"))  # 클론 신호: 이 일수 이내 출시작 이름만 봄
 LOOKBACK_DAYS = 8                                      # 비교용으로 불러올 과거 일수
 AFK_VISITS_PER_CCU = float(os.getenv("AFK_VISITS_PER_CCU", "8"))  # 이보다 낮으면 ⚠️
 
@@ -417,10 +418,40 @@ def keyword_index(names: dict[str, str], dedupe: bool = True) -> dict[str, set[s
     return idx
 
 
-def charted_names(daily: dict | None) -> dict[str, str]:
+# 장르를 뜻하는 흔한 단어는 트렌드 신호가 아니므로 클론 신호에서 제외
+GENRE_WORDS = {
+    "simulator", "simulation", "sim", "tycoon", "tower", "towers", "defense", "defence", "obby", "obbies",
+    "anime", "roleplay", "rpg", "horror", "story", "world", "build", "builder", "avatar", "city", "life",
+    "school", "house", "home", "war", "wars", "survival", "survive", "race", "racing", "run", "runner",
+    "fight", "fighting", "fighters", "battle", "battles", "pvp", "fps", "shooter", "army", "military",
+    "hangout", "chill", "minigames", "mini", "tag", "hide", "seek", "parkour", "difficulty", "chart",
+    "clicker", "tap", "idle", "incremental", "merge", "farm", "farming", "fishing", "fish", "pet", "pets",
+    "dress", "fashion", "creator", "studio", "catalog", "edition", "remastered", "classic", "legends",
+    "legend", "adventure", "adventures", "quest", "dungeon", "dungeons", "zombie", "zombies", "car", "cars",
+}
+
+
+def charted_names(daily: dict | None, ref_day: date | None = None, max_age: int | None = None) -> dict[str, str]:
+    """그날 차트에 오른 게임 이름. max_age가 있으면 ref_day 기준 그 일수 이내 출시작만."""
     if not daily:
         return {}
-    return {u: g.get("n", "") for u, g in daily.get("games", {}).items() if g.get("r")}
+    out = {}
+    for u, g in daily.get("games", {}).items():
+        if not g.get("r"):
+            continue
+        if max_age is not None:
+            try:
+                age = (ref_day - date.fromisoformat(g.get("c", "")[:10])).days
+            except ValueError:
+                continue
+            if age < 0 or age > max_age:
+                continue
+        out[u] = g.get("n", "")
+    return out
+
+
+def is_genre_keyword(kw: str) -> bool:
+    return all(w in GENRE_WORDS for w in kw.split())
 
 
 def search_keyword(keyword: str) -> dict | None:
@@ -562,29 +593,44 @@ def analyze(report_day: str, days: dict[str, dict], watch: dict, meta: dict, ran
             young.append({"uid": uid, "age": age, "st": st, "pst": pst})
     young.sort(key=lambda r: r["st"]["avg"], reverse=True)
 
-    # 5) 클론 신호
+    # 5) 클론 신호: 최근 출시작(KW_YOUNG_DAYS일 이내) 이름에 3개 이상 겹치는 키워드. 장르 단어는 제외
     clones = []
-    names_now = charted_names(cur)
     base_k = None
     for back in (7, 6, 5, 4, 3, 2, 1):
         k = day_str(D - timedelta(days=back))
         if k in dd:
             base_k = k
             break
+    names_now = charted_names(cur, D, KW_YOUNG_DAYS)
     idx_now = keyword_index(names_now)
-    idx_prev = keyword_index(charted_names(dd.get(base_k)), dedupe=False) if base_k else {}
+    idx_prev = {}
+    if base_k:
+        bd = date.fromisoformat(base_k)
+        idx_prev = keyword_index(charted_names(dd.get(base_k), bd, KW_YOUNG_DAYS), dedupe=False)
+
+    def avg_of(u):
+        s = stats_on(u, D)
+        return s["avg"] if s else 0
+
+    def age_of(u):
+        try:
+            return (D - date.fromisoformat(games[u].get("c", "")[:10])).days
+        except (KeyError, ValueError):
+            return None
+
     for kw, ids in idx_now.items():
-        if len(ids) < 3:
+        if len(ids) < 3 or is_genre_keyword(kw):
             continue
         before = len(idx_prev.get(kw, set())) if base_k else None
-        if before is not None and len(ids) <= before:
-            continue
-        def avg_of(u):
-            s = stats_on(u, D)
-            return s["avg"] if s else 0
+        if before is not None and len(ids) < before:
+            continue  # 줄어든 키워드는 제외 (유지·증가만)
+        ages = [a for u in ids if (a := age_of(u)) is not None]
         top = sorted(ids, key=avg_of, reverse=True)
-        clones.append({"kw": kw, "count": len(ids), "before": before, "examples": top[:3], "ccu": sum(avg_of(u) for u in ids)})
-    clones.sort(key=lambda c: (c["count"] - (c["before"] or 0), c["ccu"]), reverse=True)
+        clones.append({"kw": kw, "count": len(ids), "before": before, "examples": top[:3],
+                       "ccu": sum(avg_of(u) for u in ids),
+                       "avg_age": round(sum(ages) / len(ages)) if ages else None,
+                       "newest": min(ages) if ages else None})
+    clones.sort(key=lambda c: (c["count"] - (c["before"] if c["before"] is not None else 0), c["count"], c["ccu"]), reverse=True)
     clones = clones[:TOP_N]
     if do_search:
         for c in clones[:5]:
@@ -754,17 +800,23 @@ def build_embeds(a: dict, L: Linker, report_hhmm: str) -> list[dict]:
 
     lines = []
     for c in a["clones"]:
-        before = f"{c['before']}→" if c["before"] is not None else ""
+        if c["before"] is None:
+            cnt = f"{c['count']}개"
+        elif c["count"] > c["before"]:
+            cnt = f"{c['before']}→**{c['count']}**개"
+        else:
+            cnt = f"{c['count']}개(유지)"
+        age = f" · 평균 출시 {c['avg_age']}일(가장 최근 {c['newest']}일)" if c["avg_age"] is not None else ""
         srch = ""
         if c.get("search"):
-            srch = f" · 검색 {c['search']['count']}개(동접 {fmt_num(c['search']['ccu'])})"
+            srch = f" · 검색 {c['search']['count']}개"
         ex = ", ".join(L.link(u, 24) for u in c["examples"])
-        lines.append(f"**`{c['kw']}`** 차트 {before}{c['count']}개 · 평균 동접 합 {fmt_num(c['ccu'])}{srch}\n　{ex}")
+        lines.append(f"**`{c['kw']}`** 최근작 {cnt} · 평균 동접 합 {fmt_num(c['ccu'])}{age}{srch}\n　{ex}")
     if a["base_k"]:
         gap = (D - date.fromisoformat(a["base_k"])).days
-        title = f"🧬 클론 신호 · {gap}일 전보다 늘어난 키워드"
+        title = f"🧬 클론 신호 · 출시 {KW_YOUNG_DAYS}일 이내 게임에 겹치는 키워드 ({gap}일 전 대비)"
     else:
-        title = "🧬 클론 신호 · 3개 이상 게임 이름에 나온 키워드"
+        title = f"🧬 클론 신호 · 출시 {KW_YOUNG_DAYS}일 이내 게임 3개 이상에 겹치는 키워드"
     E.append({"title": title, "description": clamp_lines(lines), "color": COLORS["clone"]})
     return E
 
