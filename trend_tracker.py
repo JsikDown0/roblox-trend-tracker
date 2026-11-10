@@ -59,12 +59,13 @@ MAX_SORTS = int(os.getenv("MAX_SORTS", "40"))          # 기준별 수집할 정
 EARN_TOP = int(os.getenv("EARN_TOP", "50"))           # 매출 순위: 이 순위 안을 대상으로 봄
 EARN_JUMP = int(os.getenv("EARN_JUMP", "10"))         # 매출 순위: 하루에 이만큼 이상 오르면 표시
 WEEKLY_DAY = int(os.getenv("WEEKLY_DAY", "6"))         # 주간 요약을 붙일 리포트 기준 요일(0=월 … 6=일 → 월요일 아침에 도착)
+DEVICE_GAP = int(os.getenv("DEVICE_GAP", "30"))       # 모바일/PC 순위 차이가 이 이상이면 표시
 KW_YOUNG_DAYS = int(os.getenv("KW_YOUNG_DAYS", "90"))  # 클론 신호: 이 일수 이내 출시작 이름만 봄
 LOOKBACK_DAYS = 8                                      # 비교용으로 불러올 과거 일수
 AFK_VISITS_PER_CCU = float(os.getenv("AFK_VISITS_PER_CCU", "8"))  # 이보다 낮으면 ⚠️
 
 # 수집 기준: "국가:기기" 쉼표 구분. 첫 번째가 기본 기준.
-VARIANTS_RAW = os.getenv("VARIANTS", "all:computer,kr:phone")
+VARIANTS_RAW = os.getenv("VARIANTS", "all:computer,all:phone,kr:phone")
 VARIANT_LABELS = {"all:computer": "전체·PC", "kr:phone": "한국·모바일", "all:phone": "전체·모바일", "kr:computer": "한국·PC"}
 
 FEATURED_SORT_KEYWORDS = ["trending", "up-and-coming", "up and coming"]
@@ -74,6 +75,9 @@ SKIP_SORT_KEYWORDS = ["continue", "favorite", "friends", "recommended-for-you", 
 EXPLORE = "https://apis.roblox.com/explore-api/v1"
 SEARCH = "https://apis.roblox.com/search-api/omni-search"
 GAMES_API = "https://games.roblox.com/v1/games"
+VOTES_API = "https://games.roblox.com/v1/games/votes"
+PASSES_API_NEW = "https://apis.roblox.com/game-passes/v1/universes/{uid}/game-passes"
+PASSES_API_OLD = "https://games.roblox.com/v1/games/{uid}/game-passes"
 DEVICE_EXTRA = {"cpuCores": "8", "maxResolution": "1920x1080", "maxMemory": "8192", "networkType": "wifi"}
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) roblox-trend-tracker/2.0"
 
@@ -242,6 +246,9 @@ def collect_run(now: datetime, watch_ids: list[str]) -> dict:
                 rec.setdefault("place", g.get("rootPlaceId"))
                 if g.get("playerCount") is not None:
                     rec["playing"] = int(g["playerCount"])
+                if g.get("totalUpVotes") is not None:
+                    rec["up"] = int(g["totalUpVotes"])
+                    rec["down"] = int(g.get("totalDownVotes") or 0)
             if ids:
                 vsorts[sid] = {"name": name, "ids": ids, "sponsored": is_sponsored(sid, name)}
         if vsorts:
@@ -262,6 +269,11 @@ def collect_run(now: datetime, watch_ids: list[str]) -> dict:
         rec["visits"] = int(d.get("visits") or 0)
         rec["created"] = (d.get("created") or "")[:10]
         rec["fav"] = int(d.get("favoritedCount") or 0)
+        rec["updated"] = d.get("updated") or ""
+        cr = d.get("creator") or {}
+        rec["ctype"] = cr.get("type") or ""
+        rec["cname"] = cr.get("name") or ""
+        rec["cid"] = cr.get("id")
 
     return {"ts": int(now.timestamp()), "hhmm": now.strftime("%H:%M"), "variants": variants, "games": games}
 
@@ -316,7 +328,16 @@ def merge_run(daily: dict, run: dict) -> dict:
         if g.get("created"):
             rec["c"] = g["created"]
         if g.get("fav") is not None:
+            rec.setdefault("f0", g["fav"])
             rec["f"] = g["fav"]
+        if g.get("up") is not None:
+            rec["up"], rec["dn"] = g["up"], g.get("down", 0)
+        if g.get("updated"):
+            rec["u"] = g["updated"]
+        if g.get("ctype"):
+            rec["ct"] = g["ctype"]
+            rec["cn"] = g.get("cname", "")
+            rec["ci"] = g.get("cid")
         if g.get("playing") is not None:
             rec["s"].append([run["hhmm"], g["playing"]])
         if g.get("visits"):
@@ -476,9 +497,64 @@ def search_keyword(keyword: str) -> dict | None:
     return {"count": count, "ccu": ccu}
 
 
+def fetch_votes(uids: list[str]) -> dict[str, tuple[int, int]]:
+    """좋아요/싫어요 수. 실패하면 빈 dict."""
+    out = {}
+    for i in range(0, len(uids), 50):
+        chunk = uids[i : i + 50]
+        try:
+            data = http_get_json(VOTES_API, {"universeIds": ",".join(chunk)}, retries=2)
+        except RuntimeError as e:
+            print(f"[경고] 좋아요 조회 실패: {e}", file=sys.stderr)
+            break
+        for v in data.get("data", []) or []:
+            if v.get("id") is not None:
+                out[str(v["id"])] = (int(v.get("upVotes") or 0), int(v.get("downVotes") or 0))
+        time.sleep(0.3)
+    return out
+
+
+def fetch_gamepasses(uid: str) -> dict | None:
+    """판매 중인 게임패스 개수와 가격대(Robux). 실패하면 None."""
+    items = None
+    for url, params, key in (
+        (PASSES_API_NEW.format(uid=uid), {"passView": "Full", "pageSize": "100"}, "gamePasses"),
+        (PASSES_API_OLD.format(uid=uid), {"limit": "100", "sortOrder": "Asc"}, "data"),
+    ):
+        try:
+            data = http_get_json(url, params, retries=2)
+        except RuntimeError:
+            continue
+        if isinstance(data, dict) and isinstance(data.get(key), list):
+            items = data[key]
+            break
+    if items is None:
+        return None
+    prices = []
+    for it in items:
+        price = it.get("price")
+        if price is None:
+            price = (it.get("priceInformation") or {}).get("defaultPriceInRobux")
+        for_sale = it.get("isForSale", True)
+        if price and for_sale is not False:
+            prices.append(int(price))
+    prices.sort()
+    if not prices:
+        return {"n": 0}
+    return {"n": len(prices), "min": prices[0], "max": prices[-1], "med": prices[len(prices) // 2]}
+
+
 # ──────────────────────────────────────────────────────────────
 # 분석
 # ──────────────────────────────────────────────────────────────
+def rank_map(ids: list[str]) -> dict[str, int]:
+    """id 목록 → 순위 (같은 게임이 두 번 있으면 앞쪽 순위)"""
+    out = {}
+    for i, u in enumerate(ids, start=1):
+        out.setdefault(u, i)
+    return out
+
+
 def day_str(d: date) -> str:
     return d.isoformat()
 
@@ -514,17 +590,25 @@ def analyze(report_day: str, days: dict[str, dict], watch: dict, meta: dict, ran
                 if sid in used or not (kw in sid.lower() or kw in s["name"].lower()):
                     continue
                 prev_ids = ((ranks_prev or {}).get(main_vk, {}).get(sid) or {}).get("ids", [])
-                prev_rank = {u: i + 1 for i, u in enumerate(prev_ids)}
+                prev_rank = rank_map(prev_ids)
                 rows = [{"uid": u, "rank": i + 1, "prev_rank": prev_rank.get(u), "has_prev": bool(prev_ids),
                          "st": stats_on(u, D)} for i, u in enumerate(s["ids"][:TOP_N])]
                 featured.append({"name": s["name"], "rows": rows})
                 used.add(sid)
                 break
-        main_top = set()
-        for s in main.values():
-            if not s.get("sponsored"):
-                main_top.update(s["ids"][:50])
+        def top_set(vk):
+            out = set()
+            for s in ranks_now.get(vk, {}).values():
+                if not s.get("sponsored"):
+                    out.update(s["ids"][:50])
+            return out
+
         for vk in VARIANTS[1:]:
+            country, dev = vk.split(":", 1)
+            if country == "all":
+                continue  # 기기 차이는 아래 모바일/PC 섹션에서 다룸
+            base_vk = f"all:{dev}" if f"all:{dev}" in ranks_now else main_vk
+            main_top = top_set(base_vk)
             seen = []
             for sid, s in ranks_now.get(vk, {}).items():
                 if s.get("sponsored") or not any(k in sid.lower() or k in s["name"].lower() for k in FEATURED_SORT_KEYWORDS):
@@ -533,7 +617,31 @@ def analyze(report_day: str, days: dict[str, dict], watch: dict, meta: dict, ran
                     if u not in main_top and u not in seen:
                         seen.append(u)
             if seen:
-                kr_only.append({"vk": vk, "rows": [{"uid": u, "st": stats_on(u, D)} for u in seen[:TOP_N]]})
+                kr_only.append({"vk": vk, "base": base_vk, "rows": [{"uid": u, "st": stats_on(u, D)} for u in seen[:TOP_N]]})
+
+    # 1-2) 모바일 vs PC: 같은 정렬에서 기기별 순위 차이가 큰 게임
+    device = {"mobile": [], "pc": []}
+    pc_vk, mo_vk = "all:computer", "all:phone"
+    if ranks_now and pc_vk in ranks_now and mo_vk in ranks_now:
+        best = {"mobile": {}, "pc": {}}
+        for kw in ["trending", "earning", "up-and-coming"]:
+            sid = next((x for x in ranks_now[pc_vk] if kw in x.lower()), None)
+            if not sid or sid not in ranks_now[mo_vk]:
+                continue
+            name = ranks_now[pc_vk][sid]["name"]
+            pc_r = rank_map(ranks_now[pc_vk][sid]["ids"])
+            mo_r = rank_map(ranks_now[mo_vk][sid]["ids"])
+            for side, mine, other in (("mobile", mo_r, pc_r), ("pc", pc_r, mo_r)):
+                for u, r in mine.items():
+                    if r > 30:
+                        continue
+                    o = other.get(u)
+                    if o is None or o - r >= DEVICE_GAP:
+                        prevb = best[side].get(u)
+                        if prevb is None or r < prevb["rank"]:
+                            best[side][u] = {"uid": u, "sort": name, "rank": r, "other": o, "st": stats_on(u, D)}
+        for side in ("mobile", "pc"):
+            device[side] = sorted(best[side].values(), key=lambda x: x["rank"])[:8]
 
     # 2) 급상승: 지표(하루 방문 증가량, 없으면 평균 동접)가 연속 상승 + 약 3일 전 대비 1.3배 이상
     rising = []
@@ -719,6 +827,7 @@ def analyze(report_day: str, days: dict[str, dict], watch: dict, meta: dict, ran
         "clones": clones,
         "has_compare": len(hist_days) >= 2,
         "earn": earn,
+        "device": device,
     }
 
 
@@ -743,13 +852,75 @@ def md_escape(s: str) -> str:
     return re.sub(r"([\\*_~`|>])", r"\\\1", s)
 
 
+def parse_iso(ts: str):
+    if not ts:
+        return None
+    ts = ts.replace("Z", "+00:00")
+    m = re.match(r"(.*T\d\d:\d\d:\d\d)(\.\d+)?(.*)", ts)
+    if m:
+        frac = (m.group(2) or "")[:7]
+        ts = m.group(1) + frac + m.group(3)
+    try:
+        dt = datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 class Linker:
-    def __init__(self, days: dict[str, dict], report_day: str):
+    def __init__(self, days: dict[str, dict], report_day: str, now: datetime | None = None, votes: dict | None = None):
         self.info = {}
         for k in sorted(days):
             for uid, g in (days[k] or {}).get("games", {}).items():
                 self.info[uid] = g
         self.D = date.fromisoformat(report_day)
+        self.cur = days.get(report_day) or {}
+        self.prev = days.get(day_str(self.D - timedelta(days=1))) or {}
+        self.now = now or datetime.now(KST)
+        self.votes = votes or {}
+        # 같은 개발자가 차트에 올린 게임 수
+        self.creator_count = defaultdict(int)
+        for g in self.cur.get("games", {}).values():
+            if g.get("r") and g.get("ci"):
+                self.creator_count[g["ci"]] += 1
+
+    def tags(self, uid: str) -> str:
+        g = self.info.get(uid, {})
+        cg = self.cur.get("games", {}).get(uid, {})
+        out = []
+        up, dn = g.get("up"), g.get("dn")
+        if up is None and uid in self.votes:
+            up, dn = self.votes[uid]
+        if up is not None and (up + (dn or 0)) >= 50:
+            out.append(f"👍{round(up / (up + (dn or 0)) * 100)}%")
+        # 방문 대비 즐겨찾기 증가율
+        pg = self.prev.get("games", {}).get(uid, {})
+        fav_pct = None
+        if cg.get("f") is not None and cg.get("v1"):
+            if pg.get("f") is not None and pg.get("v1") and cg["v1"][1] - pg["v1"][1] >= 1000:
+                fav_pct = (cg["f"] - pg["f"]) / (cg["v1"][1] - pg["v1"][1]) * 100
+            elif cg.get("f0") is not None and cg.get("v0") and cg["v1"][1] - cg["v0"][1] >= 1000:
+                fav_pct = (cg["f"] - cg["f0"]) / (cg["v1"][1] - cg["v0"][1]) * 100
+        if fav_pct is not None and fav_pct >= 0:
+            out.append(f"⭐{fav_pct:.1f}%")
+        rv = [r for k, r in (cg.get("r") or {}).items() if "revisit" in k]
+        if rv:
+            out.append(f"🔁재방문{min(rv)}위")
+        up_dt = parse_iso(g.get("u", ""))
+        if up_dt:
+            hours = (self.now - up_dt).total_seconds() / 3600
+            if 0 <= hours < 24:
+                out.append("🛠오늘 업뎃")
+            elif 24 <= hours < 72:
+                out.append(f"🛠업뎃 {int(hours // 24)}일 전")
+        ct = g.get("ct")
+        if ct:
+            label = "👤개인" if ct == "User" else "👥그룹"
+            n = self.creator_count.get(g.get("ci"), 0)
+            if n >= 2:
+                label += f"(차트 {n}개)"
+            out.append(label)
+        return (" · " + " ".join(out)) if out else ""
 
     def link(self, uid: str, max_len: int = 36) -> str:
         g = self.info.get(uid, {})
@@ -761,6 +932,9 @@ class Linker:
         return f"[{md_escape(name)}]({url})"
 
     def age(self, uid: str) -> str:
+        return self._age(uid) + self.tags(uid)
+
+    def _age(self, uid: str) -> str:
         c = self.info.get(uid, {}).get("c")
         if not c:
             return ""
@@ -807,7 +981,7 @@ def build_embeds(a: dict, L: Linker, report_hhmm: str) -> list[dict]:
     head = [
         f"**{D.month}/{D.day}({wd}) {span}** 기준 · 측정 {a['runs']}회 · 게임 {a['n_games']}개 (관심 목록 {a['n_watch']}개)",
         f"순위는 오늘 {report_hhmm} KST 기준",
-        "⚠️ 방문 대비 동접이 높음(AFK 가능성)",
+        "👍좋아요 비율 · ⭐방문 대비 즐겨찾기 증가율 · 🔁재방문 차트 순위 · 🛠최근 업데이트 · 👤개인/👥그룹 개발 · ⚠️AFK 가능성",
     ]
     if a["n_days"] < 2:
         head.append("\n기록이 아직 하루치라 비교 섹션은 내일부터 채워져요. 1주일쯤 쌓이면 연속 상승·요일 비교·클론 신호가 제대로 작동해요.")
@@ -833,7 +1007,20 @@ def build_embeds(a: dict, L: Linker, report_hhmm: str) -> list[dict]:
     for k in a["kr_only"]:
         lines = [f"{L.link(r['uid'])}{flags(r['st'])} · 동접 {fmt_num(day_stats_latest(L, r['uid']))}{L.age(r['uid'])}"
                  for r in k["rows"]]
-        E.append({"title": f"🇰🇷 {vlabel(k['vk'])}에서만 상위권", "description": clamp_lines(lines), "color": COLORS["kr"]})
+        E.append({"title": f"🇰🇷 {vlabel(k['vk'])}에서만 상위권 ({vlabel(k['base'])} 대비)", "description": clamp_lines(lines),
+                  "color": COLORS["kr"]})
+
+    dv = a.get("device") or {}
+    for side, icon, me, other in (("mobile", "📱", "모바일", "PC"), ("pc", "🖥", "PC", "모바일")):
+        rows = dv.get(side) or []
+        if not rows:
+            continue
+        lines = []
+        for r in rows:
+            o = f"{r['other']}위" if r["other"] else "100위 밖"
+            lines.append(f"{L.link(r['uid'])}{flags(r['st'])} · {r['sort']} {me} **{r['rank']}위** / {other} {o}{L.age(r['uid'])}")
+        E.append({"title": f"{icon} {me}에서 훨씬 높은 게임 (전체 기준, {DEVICE_GAP}계단 이상 차이)",
+                  "description": clamp_lines(lines), "color": COLORS["kr"]})
 
     if a["has_compare"]:
         lines = []
@@ -861,7 +1048,7 @@ def build_embeds(a: dict, L: Linker, report_hhmm: str) -> list[dict]:
         if pst:
             delta = f" (전날 {fmt_num(pst['avg'])}, ×{st['avg'] / max(pst['avg'], 1):.1f})"
         vpd = f" · 하루 방문 {fmt_num(st['vpd'])}" if st["vpd"] else ""
-        lines.append(f"{L.link(r['uid'])}{flags(st)} · 출시 {r['age']}일 · 평균 동접 **{fmt_num(st['avg'])}**{delta}{vpd}")
+        lines.append(f"{L.link(r['uid'])}{flags(st)} · 출시 {r['age']}일 · 평균 동접 **{fmt_num(st['avg'])}**{delta}{vpd}{L.tags(r['uid'])}")
     E.append({"title": f"🐣 신작 레이더 · 출시 {NEW_GAME_DAYS}일 이내", "description": clamp_lines(lines), "color": COLORS["young"]})
 
     ea = a.get("earn") or {}
@@ -907,6 +1094,13 @@ def build_embeds(a: dict, L: Linker, report_hhmm: str) -> list[dict]:
                 for r in ea["efficient"]:
                     pr = f"동접 순위 {r['play_rank']}위" if r["play_rank"] else "동접 상위 100 밖"
                     lines.append(f"매출 {r['rank']}위 · {pr} · {L.link(r['uid'])}")
+            if ea.get("passes"):
+                lines.append("\n__게임패스 구성__ (판매 중, 로벅스)")
+                for u, ps in ea["passes"].items():
+                    if ps["n"] == 0:
+                        lines.append(f"{L.link(u, 28)} · 판매 중인 게임패스 없음")
+                    else:
+                        lines.append(f"{L.link(u, 28)} · {ps['n']}개 · {ps['min']:,}~{ps['max']:,} R$ (중간값 {ps['med']:,})")
             title = "📅 주간 매출 상위 %d" % len(ea["weekly"]) + (" (1주 전 대비)" if ea["weekly"] and ea["weekly"][0]["has_prev7"] else "")
             E.append({"title": title, "description": clamp_lines(lines), "color": COLORS["earn"]})
 
@@ -1000,7 +1194,44 @@ def make_report(now: datetime, today_daily: dict, watch: dict, meta: dict, do_se
 
     a = analyze(report_day, {k: v for k, v in days.items() if k <= report_day or k == day_str(today)},
                 watch, meta, ranks_now, ranks_prev, do_search=do_search)
-    L = Linker({k: v for k, v in days.items() if v}, report_day)
+    days_ok = {k: v for k, v in days.items() if v}
+
+    # 리포트에 나올 게임 중 좋아요 정보가 없는 것만 따로 조회
+    shown = set()
+    for f in a["featured"]:
+        shown.update(r["uid"] for r in f["rows"])
+    for k in a["kr_only"]:
+        shown.update(r["uid"] for r in k["rows"])
+    for key in ("rising", "new_entries", "young"):
+        shown.update(r["uid"] for r in a[key])
+    for side in ("mobile", "pc"):
+        shown.update(r["uid"] for r in (a.get("device") or {}).get(side, []))
+    ea = a.get("earn") or {}
+    for key in ("new", "jump", "young"):
+        shown.update(r["uid"] for r in ea.get(key, []))
+    for r in ea.get("weekly") or []:
+        shown.add(r["uid"])
+    info_now = {}
+    for k in sorted(days_ok):
+        info_now.update(days_ok[k].get("games", {}))
+    need = sorted(u for u in shown if info_now.get(u, {}).get("up") is None)
+    votes = fetch_votes(need) if (need and do_search) else {}
+
+    # 주간 요약이면 게임패스 구성 (수익 효율 게임 + 매출 상위 신작, 최대 8개)
+    if do_search and ea.get("weekly"):
+        targets = []
+        for r in ea.get("efficient", []) + ea.get("young", []):
+            if r["uid"] not in targets:
+                targets.append(r["uid"])
+        passes = {}
+        for u in targets[:8]:
+            res = fetch_gamepasses(u)
+            if res is not None:
+                passes[u] = res
+            time.sleep(0.3)
+        ea["passes"] = passes
+
+    L = Linker(days_ok, report_day, now=now, votes=votes)
     today_daily.pop("partial", None)
     return build_embeds(a, L, today_daily.get("latest_at", now.strftime("%H:%M")))
 
