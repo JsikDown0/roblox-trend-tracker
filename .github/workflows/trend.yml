@@ -42,7 +42,7 @@ jobs:
           NEW_GAME_DAYS: "60"                 # 신작 기준 (출시 후 일수)
           TOP_N: "10"                         # 섹션별 표시 개수
           WATCH_DAYS: "30"                    # 차트에서 빠진 뒤에도 계속 추적하는 일수
-          VARIANTS: "all:computer,all:phone,kr:phone"   # 수집 기준(국가:기기). 첫 번째가 기본
+          VARIANTS: "all:computer,kr:phone"   # 수집 기준(국가:기기). 첫 번째가 기본 (로블록스가 기기 설정은 순위에 반영하지 않아서 all:phone은 뺐어요)
         run: python trend_tracker.py
 
       - name: 기록 저장

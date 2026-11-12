@@ -66,7 +66,7 @@ LOOKBACK_DAYS = 8                                      # 비교용으로 불러�
 AFK_VISITS_PER_CCU = float(os.getenv("AFK_VISITS_PER_CCU", "8"))  # 이보다 낮으면 ⚠️
 
 # 수집 기준: "국가:기기" 쉼표 구분. 첫 번째가 기본 기준.
-VARIANTS_RAW = os.getenv("VARIANTS", "all:computer,all:phone,kr:phone")
+VARIANTS_RAW = os.getenv("VARIANTS", "all:computer,kr:phone")
 VARIANT_LABELS = {"all:computer": "전체·PC", "kr:phone": "한국·모바일", "all:phone": "전체·모바일", "kr:computer": "한국·PC"}
 
 FEATURED_SORT_KEYWORDS = ["trending", "up-and-coming", "up and coming"]
