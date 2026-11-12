@@ -705,7 +705,7 @@ def analyze(report_day: str, days: dict[str, dict], watch: dict, meta: dict, ran
             young.append({"uid": uid, "age": age, "st": st, "pst": pst})
     young.sort(key=lambda r: r["st"]["avg"], reverse=True)
 
-    # 4-2) 개인 개발 신작: 출시 KW_YOUNG_DAYS일 이내, 개인(User) 개발, 차트 진입
+    # 4-2) 개인 계정으로 올린 신작: 출시 KW_YOUNG_DAYS일 이내, 소유자 유형 User, 차트 진입 (실제 팀 규모는 알 수 없음)
     solo = []
     for uid, g in games.items():
         if not g.get("r") or g.get("ct") != "User" or not g.get("c"):
@@ -932,7 +932,7 @@ class Linker:
                 out.append(f"🛠업뎃 {int(hours // 24)}일 전")
         ct = g.get("ct")
         if ct:
-            label = "👤개인" if ct == "User" else "👥그룹"
+            label = "👤개인 계정" if ct == "User" else "👥그룹 소유"
             n = self.creator_count.get(g.get("ci"), 0)
             if n >= 2:
                 label += f"(차트 {n}개)"
@@ -998,7 +998,7 @@ def build_embeds(a: dict, L: Linker, report_hhmm: str) -> list[dict]:
     head = [
         f"**{D.month}/{D.day}({wd}) {span}** 기준 · 측정 {a['runs']}회 · 게임 {a['n_games']}개 (관심 목록 {a['n_watch']}개)",
         f"순위는 오늘 {report_hhmm} KST 기준",
-        "👍좋아요 비율 · ⭐방문 대비 즐겨찾기 증가율 · 🔁재방문 차트 순위 · 🛠최근 업데이트 · 👤개인/👥그룹 개발 · ⚠️AFK 가능성",
+        "👍좋아요 비율 · ⭐방문 대비 즐겨찾기 증가율 · 🔁재방문 차트 순위 · 🛠최근 업데이트 · 👤개인 계정/👥그룹 소유(실제 팀 규모와 다를 수 있음) · ⚠️AFK 가능성",
     ]
     if a["n_days"] < 2:
         head.append("\n기록이 아직 하루치라 비교 섹션은 내일부터 채워져요. 1주일쯤 쌓이면 연속 상승·요일 비교·클론 신호가 제대로 작동해요.")
@@ -1064,7 +1064,7 @@ def build_embeds(a: dict, L: Linker, report_hhmm: str) -> list[dict]:
             delta = f" (전날 {fmt_num(pst['avg'])})" if pst else ""
             vpd = f" · 하루 방문 {fmt_num(st['vpd'])}" if st["vpd"] else ""
             lines.append(f"{L.link(r['uid'])}{flags(st)} · 출시 {r['age']}일 · 평균 동접 **{fmt_num(st['avg'])}**{delta}{vpd}{L.tags(r['uid'])}")
-        E.append({"title": f"👤 개인 개발 신작 · 출시 {KW_YOUNG_DAYS}일 이내 (혼자 만들 수 있는 규모의 참고 사례)",
+        E.append({"title": f"👤 개인 계정으로 올린 신작 · 출시 {KW_YOUNG_DAYS}일 이내 (1인 개발 가능성이 높은 사례)",
                   "description": clamp_lines(lines), "color": COLORS["young"]})
 
     ea = a.get("earn") or {}
