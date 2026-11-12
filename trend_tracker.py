@@ -59,7 +59,6 @@ MAX_SORTS = int(os.getenv("MAX_SORTS", "40"))          # 기준별 수집할 정
 EARN_TOP = int(os.getenv("EARN_TOP", "50"))           # 매출 순위: 이 순위 안을 대상으로 봄
 EARN_JUMP = int(os.getenv("EARN_JUMP", "10"))         # 매출 순위: 하루에 이만큼 이상 오르면 표시
 WEEKLY_DAY = int(os.getenv("WEEKLY_DAY", "6"))         # 주간 요약을 붙일 리포트 기준 요일(0=월 … 6=일 → 월요일 아침에 도착)
-DEVICE_GAP = int(os.getenv("DEVICE_GAP", "30"))       # 모바일/PC 순위 차이가 이 이상이면 표시
 KW_YOUNG_DAYS = int(os.getenv("KW_YOUNG_DAYS", "90"))  # 클론 신호: 이 일수 이내 출시작 이름만 봄
 MIN_GAP_MIN = int(os.getenv("MIN_GAP_MIN", "100"))   # 직전 측정과 이 분 이내면 측정 건너뜀(중복 실행 방지)
 LOOKBACK_DAYS = 8                                      # 비교용으로 불러올 과거 일수
@@ -67,7 +66,8 @@ AFK_VISITS_PER_CCU = float(os.getenv("AFK_VISITS_PER_CCU", "8"))  # 이보다 �
 
 # 수집 기준: "국가:기기" 쉼표 구분. 첫 번째가 기본 기준.
 VARIANTS_RAW = os.getenv("VARIANTS", "all:computer,kr:phone")
-VARIANT_LABELS = {"all:computer": "전체·PC", "kr:phone": "한국·모바일", "all:phone": "전체·모바일", "kr:computer": "한국·PC"}
+# 로블록스는 기기 설정을 순위에 반영하지 않아서(11/10~12 데이터로 확인) 국가만 표시
+VARIANT_LABELS = {"all:computer": "전체", "all:phone": "전체", "kr:phone": "한국", "kr:computer": "한국"}
 
 FEATURED_SORT_KEYWORDS = ["trending", "up-and-coming", "up and coming"]
 SPONSORED_SORT_KEYWORDS = ["sponsor"]
@@ -116,7 +116,14 @@ def http_get_json(url: str, params: dict | None = None, retries: int = 4):
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             last_err = f"HTTP {e.code}"
-            if e.code == 429 or e.code >= 500:
+            if e.code == 429:
+                try:
+                    wait = float(e.headers.get("Retry-After") or 0)
+                except (TypeError, ValueError):
+                    wait = 0
+                time.sleep(min(max(wait, 8 * (attempt + 1)), 60))
+                continue
+            if e.code >= 500:
                 time.sleep(3 * (attempt + 1))
                 continue
             body = e.read().decode("utf-8", "ignore")[:300]
@@ -199,15 +206,26 @@ def fetch_sort_games(session_id: str, vk: str, sort_id: str) -> list[dict]:
 
 def fetch_game_details(universe_ids: list[int]) -> dict[int, dict]:
     out: dict[int, dict] = {}
-    for i in range(0, len(universe_ids), 50):
-        chunk = universe_ids[i : i + 50]
+    chunks = [universe_ids[i : i + 50] for i in range(0, len(universe_ids), 50)]
+    failed = []
+    for chunk in chunks:
         try:
             data = http_get_json(GAMES_API, {"universeIds": ",".join(map(str, chunk))})
             for g in data.get("data", []) or []:
                 out[int(g["id"])] = g
-        except RuntimeError as e:
-            print(f"[경고] 게임 상세 조회 일부 실패: {e}", file=sys.stderr)
-        time.sleep(0.3)
+        except RuntimeError:
+            failed.append(chunk)
+        time.sleep(0.8)
+    if failed:  # 요청 제한에 걸린 묶음은 잠시 쉬었다가 한 번 더
+        time.sleep(30)
+        for chunk in failed:
+            try:
+                data = http_get_json(GAMES_API, {"universeIds": ",".join(map(str, chunk))})
+                for g in data.get("data", []) or []:
+                    out[int(g["id"])] = g
+            except RuntimeError as e:
+                print(f"[경고] 게임 상세 조회 일부 실패({len(chunk)}개): {e}", file=sys.stderr)
+            time.sleep(2)
     return out
 
 
@@ -234,7 +252,7 @@ def collect_run(now: datetime, watch_ids: list[str]) -> dict:
             except RuntimeError as e:
                 print(f"[경고] {vk}/{sid} 조회 실패, 기본 목록 사용: {e}", file=sys.stderr)
                 sort_games = s.get("games", []) or []
-            time.sleep(0.25)
+            time.sleep(0.6)
             ids = []
             for g in sort_games:
                 uid = g.get("universeId")
@@ -621,30 +639,6 @@ def analyze(report_day: str, days: dict[str, dict], watch: dict, meta: dict, ran
             if seen:
                 kr_only.append({"vk": vk, "base": base_vk, "rows": [{"uid": u, "st": stats_on(u, D)} for u in seen[:TOP_N]]})
 
-    # 1-2) 모바일 vs PC: 같은 정렬에서 기기별 순위 차이가 큰 게임
-    device = {"mobile": [], "pc": []}
-    pc_vk, mo_vk = "all:computer", "all:phone"
-    if ranks_now and pc_vk in ranks_now and mo_vk in ranks_now:
-        best = {"mobile": {}, "pc": {}}
-        for kw in ["trending", "earning", "up-and-coming"]:
-            sid = next((x for x in ranks_now[pc_vk] if kw in x.lower()), None)
-            if not sid or sid not in ranks_now[mo_vk]:
-                continue
-            name = ranks_now[pc_vk][sid]["name"]
-            pc_r = rank_map(ranks_now[pc_vk][sid]["ids"])
-            mo_r = rank_map(ranks_now[mo_vk][sid]["ids"])
-            for side, mine, other in (("mobile", mo_r, pc_r), ("pc", pc_r, mo_r)):
-                for u, r in mine.items():
-                    if r > 30:
-                        continue
-                    o = other.get(u)
-                    if o is None or o - r >= DEVICE_GAP:
-                        prevb = best[side].get(u)
-                        if prevb is None or r < prevb["rank"]:
-                            best[side][u] = {"uid": u, "sort": name, "rank": r, "other": o, "st": stats_on(u, D)}
-        for side in ("mobile", "pc"):
-            device[side] = sorted(best[side].values(), key=lambda x: x["rank"])[:8]
-
     # 2) 급상승: 지표(하루 방문 증가량, 없으면 평균 동접)가 연속 상승 + 약 3일 전 대비 1.3배 이상
     rising = []
     for uid in games:
@@ -685,8 +679,13 @@ def analyze(report_day: str, days: dict[str, dict], watch: dict, meta: dict, ran
         for uid, w in watch.items():
             if w.get("added") == report_day:
                 st = stats_on(uid, D)
-                new_entries.append({"uid": uid, "st": st, "avg": st["avg"] if st else 0})
-        new_entries.sort(key=lambda r: r["avg"], reverse=True)
+                try:
+                    age = (D - date.fromisoformat(games.get(uid, {}).get("c", "")[:10])).days
+                except ValueError:
+                    age = None
+                new_entries.append({"uid": uid, "st": st, "avg": st["avg"] if st else 0, "age": age})
+        # 최근 출시작(KW_YOUNG_DAYS일 이내)을 먼저, 그 안에서는 동접순
+        new_entries.sort(key=lambda r: (not (r["age"] is not None and r["age"] <= KW_YOUNG_DAYS), -r["avg"]))
 
     # 4) 신작 레이더
     young = []
@@ -705,6 +704,21 @@ def analyze(report_day: str, days: dict[str, dict], watch: dict, meta: dict, ran
             pst = ser.get(day_str(D - timedelta(days=1)))
             young.append({"uid": uid, "age": age, "st": st, "pst": pst})
     young.sort(key=lambda r: r["st"]["avg"], reverse=True)
+
+    # 4-2) 개인 개발 신작: 출시 KW_YOUNG_DAYS일 이내, 개인(User) 개발, 차트 진입
+    solo = []
+    for uid, g in games.items():
+        if not g.get("r") or g.get("ct") != "User" or not g.get("c"):
+            continue
+        try:
+            age = (D - date.fromisoformat(g["c"][:10])).days
+        except ValueError:
+            continue
+        if 0 <= age <= KW_YOUNG_DAYS:
+            st = series(uid).get(report_day)
+            if st:
+                solo.append({"uid": uid, "age": age, "st": st, "pst": series(uid).get(day_str(D - timedelta(days=1)))})
+    solo.sort(key=lambda r: r["st"]["avg"], reverse=True)
 
     # 5) 클론 신호: 최근 출시작(KW_YOUNG_DAYS일 이내) 이름에 3개 이상 겹치는 키워드. 장르 단어는 제외
     clones = []
@@ -825,11 +839,12 @@ def analyze(report_day: str, days: dict[str, dict], watch: dict, meta: dict, ran
         "rising": rising[:TOP_N],
         "new_entries": new_entries[:TOP_N],
         "new_total": len(new_entries),
+        "new_young": sum(1 for r in new_entries if r["age"] is not None and r["age"] <= KW_YOUNG_DAYS),
+        "solo": solo[:TOP_N],
         "young": young[:TOP_N],
         "clones": clones,
         "has_compare": len(hist_days) >= 2,
         "earn": earn,
-        "device": device,
     }
 
 
@@ -1012,18 +1027,6 @@ def build_embeds(a: dict, L: Linker, report_hhmm: str) -> list[dict]:
         E.append({"title": f"🇰🇷 {vlabel(k['vk'])}에서만 상위권 ({vlabel(k['base'])} 대비)", "description": clamp_lines(lines),
                   "color": COLORS["kr"]})
 
-    dv = a.get("device") or {}
-    for side, icon, me, other in (("mobile", "📱", "모바일", "PC"), ("pc", "🖥", "PC", "모바일")):
-        rows = dv.get(side) or []
-        if not rows:
-            continue
-        lines = []
-        for r in rows:
-            o = f"{r['other']}위" if r["other"] else "100위 밖"
-            lines.append(f"{L.link(r['uid'])}{flags(r['st'])} · {r['sort']} {me} **{r['rank']}위** / {other} {o}{L.age(r['uid'])}")
-        E.append({"title": f"{icon} {me}에서 훨씬 높은 게임 (전체 기준, {DEVICE_GAP}계단 이상 차이)",
-                  "description": clamp_lines(lines), "color": COLORS["kr"]})
-
     if a["has_compare"]:
         lines = []
         for r in a["rising"]:
@@ -1041,7 +1044,8 @@ def build_embeds(a: dict, L: Linker, report_hhmm: str) -> list[dict]:
         lines = [f"{L.link(r['uid'])}{flags(r['st'])} · 평균 동접 {fmt_num(r['avg'])}{L.age(r['uid'])}" for r in a["new_entries"]]
         if a["new_total"] > len(a["new_entries"]):
             lines.append(f"외 {a['new_total'] - len(a['new_entries'])}개")
-        E.append({"title": "🆕 처음 차트에 등장", "description": clamp_lines(lines), "color": COLORS["new"]})
+        E.append({"title": f"🆕 처음 차트에 등장 (전체 {a['new_total']}개 중 출시 {KW_YOUNG_DAYS}일 이내 {a['new_young']}개, 신작 먼저)",
+                  "description": clamp_lines(lines), "color": COLORS["new"]})
 
     lines = []
     for r in a["young"]:
@@ -1052,6 +1056,16 @@ def build_embeds(a: dict, L: Linker, report_hhmm: str) -> list[dict]:
         vpd = f" · 하루 방문 {fmt_num(st['vpd'])}" if st["vpd"] else ""
         lines.append(f"{L.link(r['uid'])}{flags(st)} · 출시 {r['age']}일 · 평균 동접 **{fmt_num(st['avg'])}**{delta}{vpd}{L.tags(r['uid'])}")
     E.append({"title": f"🐣 신작 레이더 · 출시 {NEW_GAME_DAYS}일 이내", "description": clamp_lines(lines), "color": COLORS["young"]})
+
+    if a.get("solo"):
+        lines = []
+        for r in a["solo"]:
+            st, pst = r["st"], r["pst"]
+            delta = f" (전날 {fmt_num(pst['avg'])})" if pst else ""
+            vpd = f" · 하루 방문 {fmt_num(st['vpd'])}" if st["vpd"] else ""
+            lines.append(f"{L.link(r['uid'])}{flags(st)} · 출시 {r['age']}일 · 평균 동접 **{fmt_num(st['avg'])}**{delta}{vpd}{L.tags(r['uid'])}")
+        E.append({"title": f"👤 개인 개발 신작 · 출시 {KW_YOUNG_DAYS}일 이내 (혼자 만들 수 있는 규모의 참고 사례)",
+                  "description": clamp_lines(lines), "color": COLORS["young"]})
 
     ea = a.get("earn") or {}
     if ea.get("sid"):
@@ -1206,8 +1220,6 @@ def make_report(now: datetime, today_daily: dict, watch: dict, meta: dict, do_se
         shown.update(r["uid"] for r in k["rows"])
     for key in ("rising", "new_entries", "young"):
         shown.update(r["uid"] for r in a[key])
-    for side in ("mobile", "pc"):
-        shown.update(r["uid"] for r in (a.get("device") or {}).get(side, []))
     ea = a.get("earn") or {}
     for key in ("new", "jump", "young"):
         shown.update(r["uid"] for r in ea.get(key, []))
